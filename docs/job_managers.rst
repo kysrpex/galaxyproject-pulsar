@@ -80,24 +80,30 @@ If you are using DRMAA, be sure to define ``DRMAA_LIBRARY_PATH`` in Pulsar's
 Condor
 -------------------------------
 
-Condor_ can also be used as a backend.
+Condor_ can also be used as a job manager. Pulsar interfaces with HTCondor via calls to HTCondor's command line tools. It is configured as
+follows.
 
 ::
 
     managers:
       _default_:
         type: queued_condor
-        # Optional attributes...
+        # Submission attributes... (optional)
         submit_universe: vanilla
         submit_request_memory: 32
         submit_requirements: 'OpSys == "LINUX" && Arch =="INTEL"'
         submit_rank: "Memory >= 64"
+        # Customize the binaries that the manager will call (optional)
+        prefix: /usr/local/bin
+        condor_rm_cmd: condor_rm
+        condor_submit_cmd: condor_submit
 
-This would set universe, request_memory, requirements, and rank in the condor
-submission file to the specified values. For more information on condor
-submission files see the `HTCondor quickstart
-<http://research.cs.wisc.edu/htcondor/quick-start.html>`__ for more
-information.
+Optionally, submission parameters to be written to the condor submission file (e.g. universe, request_memory, submit_requirements,
+submit_rank) can be configured as shown above. For more information on condor submission files see the
+`HTCondor quickstart <http://research.cs.wisc.edu/htcondor/quick-start.html>`__.
+
+It is possible to configure the commands that the job manager will call to interact with HTCondor via the `prefix`, `condor_rm_cmd` and
+`condor_submit_cmd` parameters.
 
 CLI
 -------------------------------

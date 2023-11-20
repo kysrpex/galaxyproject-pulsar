@@ -27,6 +27,11 @@ class CondorQueueManager(ExternalBaseManager):
 
     def __init__(self, name, app, **kwds):
         super().__init__(name, app, **kwds)
+        self._manager_params = {
+            "prefix": str(kwds.get("prefix", "")),
+            "condor_rm_cmd": str(kwds.get("condor_rm_cmd", "condor_rm")),
+            "condor_submit_cmd": str(kwds.get("condor_submit_cmd", "condor_submit")),
+        }
         self.submission_params = submission_params(**kwds)
         self.user_log_sizes = {}
         self.state_cache = {}
@@ -53,7 +58,11 @@ class CondorQueueManager(ExternalBaseManager):
         )
         submit_file_contents = build_submit_description(**build_submit_params)
         submit_file = self._write_job_file(job_id, "job.condor.submit", submit_file_contents)
-        external_id, message = condor_submit(submit_file)
+        external_id, message = condor_submit(
+            submit_file,
+            prefix=self._manager_params.get("prefix"),
+            command=self._manager_params.get("condor_submit_cmd")
+        )
         if not external_id:
             raise Exception(message)
         self._register_external_id(job_id, external_id)
@@ -62,7 +71,11 @@ class CondorQueueManager(ExternalBaseManager):
         return self._job_file(job_id, 'job_condor.log')
 
     def _kill_external(self, external_id):
-        failure_message = condor_stop(external_id)
+        failure_message = condor_stop(
+            external_id,
+            prefix=self._manager_params.get("prefix"),
+            command=self._manager_params.get("condor_rm_cmd")
+        )
         if failure_message:
             log.warn("Failed to stop condor job with id {} - {}".format(external_id, failure_message))
 
