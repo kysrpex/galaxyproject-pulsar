@@ -1,6 +1,9 @@
 import logging
 import os
+import tempfile
 from enum import Enum
+from pathlib import Path
+from textwrap import dedent
 from typing import (
     Any,
     Callable,
@@ -10,7 +13,14 @@ from typing import (
     Optional,
 )
 from typing_extensions import Protocol
+from xml.etree.ElementTree import (
+    Element,
+    SubElement,
+    tostring,
+    fromstring,
+)
 
+from pulsar.managers.util.arc import ensure_pyarc, pyarcrest
 from pulsar.managers.util.tes import (
     ensure_tes_client,
     TesClient,
@@ -562,6 +572,263 @@ class ExecutionType(str, Enum):
     PARALLEL = "parallel"
 
 
+class ARCLaunchMixin(BaseRemoteConfiguredJobClient):
+    """Execute containers sequentially using ARC."""
+
+    ensure_library_available = ensure_pyarc
+    execution_type = ExecutionType.SEQUENTIAL
+    default_container_image = "ubuntu"  # TODO: choose an adequate image
+    pulsar_container_image = "pulsar-pod"
+
+    def launch(
+        self,
+        command_line,
+        dependencies_description=None,
+        env=None,
+        remote_staging=None,
+        job_config=None,
+        dynamic_file_sources=None,
+        container_info=None,
+        token_endpoint=None,
+        pulsar_app_config=None,
+        staging_manifest=None,
+    ) -> Optional[ExternalId]:
+        local_job_directory = Path(tempfile.mkdtemp(prefix="pulsar_arc_"))
+        input_manifest_path = local_job_directory / "input_manifest.json"
+        staging_config_path = local_job_directory / "staging_config.json"
+        with open(input_manifest_path, "w") as input_manifest_fh:
+            input_manifest_fh.write(json_dumps(staging_manifest))
+        with open(staging_config_path, mode="w") as staging_config_fh:
+            staging_config_fh.write(json_dumps(remote_staging))
+
+        # build submit, tool, and output manifest commands
+        launch_params = self._build_setup_message(
+            command_line,
+            dependencies_description=dependencies_description,
+            env=env,
+            remote_staging=remote_staging,
+            job_config=job_config,
+            dynamic_file_sources=dynamic_file_sources,
+            token_endpoint=token_endpoint,
+        )
+        container = container_info["container_id"] if container_info else None
+        guest_ports = container_info["guest_ports"] if container_info else None
+        pulsar_app_config = self.get_pulsar_app_config(
+            pulsar_app_config=pulsar_app_config,
+            container=container,
+            wait_after_submission=False,
+            manager_name="_default_",
+            manager_type="unqueued",
+            dependencies_description=dependencies_description,
+        )
+        base64_message = to_base64_json(launch_params)
+        base64_app_conf = to_base64_json(pulsar_app_config)
+        pulsar_container_image = self.pulsar_container_image
+
+        pulsar_submit = CoexecutionContainerCommand(
+            pulsar_container_image,
+            "pulsar-submit",
+            [
+                "--base64",
+                base64_message,
+                "--app_conf_base64",
+                base64_app_conf,
+                "--no_wait",
+            ],
+            job_config["job_directory"],
+            None,
+        )
+        output_manifest_path = "output_manifest.json"
+        output_manifest = CoexecutionContainerCommand(
+            self.pulsar_container_image,
+            "pulsar-create-output-manifest",
+            [
+                "--job-directory",
+                job_config["job_directory"],
+                "--staging-config-path",
+                staging_config_path.name,
+                "--output-manifest-path",
+                output_manifest_path,
+            ],
+            job_config["job_directory"],
+        )
+
+        ports = None
+        if guest_ports:
+            ports = [int(p) for p in guest_ports]
+
+        tool_container = CoexecutionContainerCommand(
+            container or self.default_container_image,
+            "sh",
+            [f"{job_config['job_directory']}/command.sh"],
+            job_config["job_directory"],
+            ports,
+        )
+
+        # build arc job
+        executable_path = Path(local_job_directory) / "job.sh"
+        with open(executable_path, "wb") as executable_fh:
+            executable: bytes = self._generate_executable(
+                job_directory=job_config["job_directory"],
+                pulsar_submit_command=pulsar_submit,
+                tool_container_command=tool_container,
+                pulsar_manifest_command=output_manifest,
+            )
+            executable_fh.write(executable)
+        job_description: bytes = self._generate_job_description(
+            input_manifest=staging_manifest,
+            executable_path=executable_path,
+            output_manifest_path=Path(output_manifest_path),
+            staging_config_path=Path(staging_config_path)
+        )
+
+        # submit arc job
+        arc_endpoint = self.destination_params["arc_url"]
+        oidc_token = self.destination_params["oidc_token"]
+        self._launch_arc_job(
+            arc_endpoint,
+            oidc_token,
+            job_description.decode("utf-8"),
+        )
+
+    @staticmethod
+    def _generate_executable(
+        job_directory: str,
+        pulsar_submit_command: CoexecutionContainerCommand,
+        tool_container_command: CoexecutionContainerCommand,
+        pulsar_manifest_command: CoexecutionContainerCommand,
+    ) -> bytes:
+        # TODO: decode container commands and run them in singularity
+        # TODO: mount directories to the container adequately
+        return dedent(f"""
+            #!/bin/bash
+
+            singularity run \\
+                --no-mount bind-paths \\
+                --bind ".":{job_directory} \\
+                --pwd {pulsar_submit_command.working_directory} \\
+                docker://{pulsar_submit_command.image} \\
+                {pulsar_submit_command.command} {" ".join(pulsar_submit_command.args)}
+                
+            singularity run \\
+                --no-mount bind-paths \\
+                --bind ".":{job_directory} \\
+                --pwd {tool_container_command.working_directory} \\                
+                docker://{tool_container_command.image} \\
+                {tool_container_command.command} {" ".join(tool_container_command.args)}
+
+            singularity run \\
+                --no-mount bind-paths \\
+                --bind ".":{job_directory} \\
+                --pwd {tool_container_command.working_directory} \\                
+                docker://{pulsar_manifest_command.image} \\
+                {pulsar_manifest_command.command} {" ".join(pulsar_manifest_command.args)}
+
+            # parse output manifest
+            # run jq on singularity to parse the output manifest
+        """).encode("utf-8")
+
+    def _generate_job_description(
+        self,
+        input_manifest: dict,
+        executable_path: Path,
+        output_manifest_path: Path,
+        staging_config_path: Path,
+    ) -> bytes:
+        # job_directory = Path(self.job_directory.job_directory)
+        # metadata_directory = Path(self.job_directory.metadata_directory)
+
+        activity_description = Element("ActivityDescription")
+        activity_description.set("xmlns", "http://www.eu-emi.eu/es/2010/12/adl")
+        activity_description.set("xmlns:emiestypes", "http://www.eu-emi.eu/es/2010/12/types")
+        activity_description.set("xmlns:nordugrid-adl", "http://www.nordugrid.org/es/2011/12/nordugrid-adl")
+
+        activity_identification = SubElement(activity_description, "ActivityIdentification")
+        activity_identification_name = SubElement(activity_identification, "Name")
+        activity_identification_name.text = f"Galaxy job {self.job_id}"
+
+        application = SubElement(activity_description, "Application")
+        application_executable = SubElement(application, "Executable")
+        application_executable_path = SubElement(application_executable, "Path")
+        application_executable_path.text = executable_path.name
+        # application_output = SubElement(application, "Output")
+        # application_output.text = metadata_directory.relative_to(job_directory) / "tool_stdout"
+        # application_error = SubElement(application, "Error")
+        # application_error.text = metadata_directory.relative_to(job_directory) / "tool_stderr"
+
+        # resources = SubElement(activity_description, "Resources")
+        # resources_cpu_time = SubElement(resources, "IndividualCPUTime")
+        # resources_cpu_time.text = self.cpu_time
+        # resources_memory = SubElement(resources, "IndividualPhysicalMemory")
+        # resources_memory.text = self.memory
+
+        data_staging = SubElement(activity_description, "DataStaging")
+        staging_config = SubElement(data_staging, "InputFile")
+        staging_config_name = SubElement(staging_config, "Name")
+        staging_config_name.text = staging_config_path.name
+        staging_config_uri = SubElement(staging_config, "URI")
+        staging_config_uri.text = f"file://{staging_config_path.absolute()}"
+        executable = SubElement(data_staging, "InputFile")
+        executable_name = SubElement(executable, "Name")
+        executable_name.text = executable_path.name
+        executable_uri = SubElement(executable, "URI")
+        executable_uri.text = f"file://{executable_path.absolute()}"
+        for input_ in input_manifest:
+            input_file = SubElement(data_staging, "InputFile")
+            input_file_name = SubElement(input_file, "Name")
+            input_file_name.text = Path(input_["to_path"]).name
+            source = SubElement(input_file, "Source")
+            uri = SubElement(source, "URI")
+            uri.text = input_["url"]
+        output_file = SubElement(data_staging, "OutputFile")
+        output_file_name = SubElement(output_file, "Name")
+        output_file_name.text = f"@{output_manifest_path}"
+
+        return tostring(activity_description, encoding="UTF-8", method="xml")
+
+    @staticmethod
+    def _launch_arc_job(
+        arc_endpoint: str,
+        oidc_token: str,
+        job_description: str,
+    ) -> Optional[ExternalId]:
+        client = pyarcrest.arc.ARCRest.getClient(
+            url=arc_endpoint,
+            token=oidc_token
+        )
+        delegation_id = client.createDelegation()
+
+        results = client.createJobs(
+            job_description,
+            delegationID=delegation_id
+        )[0].value
+
+        if isinstance(results, Exception):
+            raise results
+
+        arc_job_id, status = results
+
+        job_description_tree_root = fromstring(job_description)
+        inputs = {
+            node.find("{http://www.eu-emi.eu/es/2010/12/adl}Name").text:
+                node.find("{http://www.eu-emi.eu/es/2010/12/adl}URI").text
+            for node in job_description_tree_root.findall(
+                "./{http://www.eu-emi.eu/es/2010/12/adl}DataStaging/{http://www.eu-emi.eu/es/2010/12/adl}InputFile"
+            )
+            if node.find("{http://www.eu-emi.eu/es/2010/12/adl}URI") is not None and node.find(
+                "{http://www.eu-emi.eu/es/2010/12/adl}URI").text.startswith("file://")
+        }
+
+        upload_errors = client.uploadJobFiles([arc_job_id], [inputs])[0]
+        if upload_errors:  # input upload error
+            raise Exception("Error uploading job files to ARC")
+
+        return ExternalId(str(arc_job_id))
+
+    def kill(self):
+        pass
+
+
 class CoexecutionLaunchMixin(BaseRemoteConfiguredJobClient):
     execution_type: ExecutionType
     pulsar_container_image: str
@@ -793,6 +1060,18 @@ class LaunchesTesContainersMixin(CoexecutionLaunchMixin):
             "complete": "true" if tes_state_is_complete(tes_state) else "false",  # Ancient John, what were you thinking?
         }
 
+
+class ARCClient(BaseMessageCoexecutionJobClient, ARCLaunchMixin):
+    """A client that (sequentially) executes containers in ARC and depends on AMQP for status updates."""
+
+    def __init__(self, destination_params, job_id, client_manager):
+        super().__init__(destination_params, job_id, client_manager)
+
+    def full_status(self):
+        return {
+            "status": manager_status.COMPLETE,
+            "complete": "true",  # Ancient John, what were you thinking?
+        }
 
 class TesPollingCoexecutionJobClient(BasePollingCoexecutionJobClient, LaunchesTesContainersMixin):
     """A client that co-executes pods via GA4GH TES and depends on amqp for status updates."""
