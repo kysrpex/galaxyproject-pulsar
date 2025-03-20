@@ -24,12 +24,12 @@ def post_file(url, path):
     m = requests_toolbelt.MultipartEncoder(
         fields={'file': ('filename', open(path, 'rb'))}
     )
-    requests.post(url, data=m, headers={'Content-Type': m.content_type})
+    requests.post(url, data=m, headers={'Content-Type': m.content_type}, verify=False)
 
 
 def get_file(url, path):
     __ensure_requests()
-    r = requests.get(url, stream=True)
+    r = requests.get(url, stream=True, verify=False)
     with open(path, 'wb') as f:
         for chunk in r.iter_content(chunk_size=1024):
             if chunk:  # filter out keep-alive new chunks
